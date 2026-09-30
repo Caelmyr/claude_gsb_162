@@ -132,17 +132,32 @@ class Scheduler:
         ]
         if not pending:
             return
-        workers = self._available_workers()
+        workers = self.registry.alive()
         if not workers:
             return
+
+        # Track in-flight tasks per worker ourselves.  Heartbeat metrics are
+        # seconds stale, so scoring by them alone would name the same worker
+        # "least loaded" for every iteration of the loop below and pile the
+        # whole stage onto one node.  The capacity check must likewise be
+        # re-evaluated per task, not once before the loop.
+        inflight = {w.worker_id: self._count_running_on(w.worker_id) for w in workers}
+        capacity = {
+            w.worker_id: max(1, min(w.cpu_cores or 2, MAX_TASKS_PER_WORKER))
+            for w in workers
+        }
 
         for task in pending:
             if task.status == C.TASK_RETRYING and task.retry_after_ms > now_ms():
                 continue  # exponential backoff not yet elapsed
-            worker = self._least_loaded(workers, exclude=None)
+            candidates = [w for w in workers if inflight[w.worker_id] < capacity[w.worker_id]]
+            worker = self._least_loaded(candidates, exclude=None, inflight=inflight)
             if worker is None:
-                return
+                return  # cluster at capacity; remaining tasks wait for the next tick
             self._dispatch(job, task, worker)
+            # Count the attempt even if the worker refused it, so a sick worker
+            # is not retried for every remaining task in this same tick.
+            inflight[worker.worker_id] += 1
 
     def _available_workers(self) -> list[WorkerRecord]:
         out: list[WorkerRecord] = []
@@ -164,13 +179,19 @@ class Scheduler:
         return count
 
     def _least_loaded(self, workers: list[WorkerRecord],
-                      exclude: Optional[str] = None) -> Optional[WorkerRecord]:
+                      exclude: Optional[str] = None,
+                      inflight: Optional[dict[str, int]] = None) -> Optional[WorkerRecord]:
         candidates = [w for w in workers if w.worker_id != exclude] or workers
         if not candidates:
             return None
+        if inflight is None:
+            inflight = {w.worker_id: self._count_running_on(w.worker_id) for w in candidates}
 
         def load(w: WorkerRecord) -> float:
-            return w.load1 * 2.0 + w.cpu_percent * 0.01
+            # Tasks already in flight dominate; heartbeat metrics break ties.
+            return (inflight.get(w.worker_id, 0) * 1.0
+                    + w.load1 * 0.25
+                    + w.cpu_percent * 0.01)
 
         return min(candidates, key=load)
 

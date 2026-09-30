@@ -76,7 +76,7 @@ class WorkerServer:
         return {
             "cpu_percent": res["cpu_percent"],
             "mem_percent": res["mem_percent"],
-            "load1": round(res["load1"] * 10.0, 2),
+            "load1": round(res["load1"], 2),
             "cpu_cores": res["cpu_cores"],
             "mem_total_mb": res["mem_total_mb"],
             "running_tasks": self.executor.running_count,
