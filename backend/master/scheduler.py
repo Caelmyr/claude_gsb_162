@@ -132,14 +132,16 @@ class Scheduler:
         ]
         if not pending:
             return
-        workers = self._available_workers()
-        if not workers:
-            return
 
+        # Re-evaluate availability and load for every task: ``_dispatch``
+        # updates task state synchronously, so each iteration sees the
+        # placements made earlier in this tick.  (Previously the worker list
+        # and its stale heartbeat scores were computed once, so every pending
+        # task in a tick landed on the same worker.)
         for task in pending:
             if task.status == C.TASK_RETRYING and task.retry_after_ms > now_ms():
                 continue  # exponential backoff not yet elapsed
-            worker = self._least_loaded(workers, exclude=None)
+            worker = self._least_loaded(self._available_workers(), exclude=None)
             if worker is None:
                 return
             self._dispatch(job, task, worker)
@@ -170,13 +172,18 @@ class Scheduler:
             return None
 
         def load(w: WorkerRecord) -> float:
-            return w.load1 * 2.0 + w.cpu_percent * 0.01
+            # Master-side in-flight task count (fresh, reflects dispatches
+            # made earlier in this tick) dominates; heartbeat metrics only
+            # break ties.  Same weights as WorkerRecord.load_score.
+            return (self._count_running_on(w.worker_id) * 1.0
+                    + w.load1 * 0.25
+                    + w.cpu_percent * 0.01)
 
         return min(candidates, key=load)
 
     # ------------------------------------------------------------------
     def _dispatch(self, job: Job, task: Task, worker: WorkerRecord,
-                  speculative: bool = False) -> None:
+                  speculative: bool = False) -> bool:
         spec = self._build_spec(job, task)
         if speculative:
             spec["speculative"] = True
@@ -189,7 +196,7 @@ class Scheduler:
             self.logbus.warn(job.job_id, f"dispatch to {worker.name} failed: {exc}",
                              task_id=task.task_id)
         if not accepted:
-            return
+            return False
 
         def mark_dispatched(t: Task) -> None:
             t.status = C.TASK_ASSIGNED
@@ -207,6 +214,7 @@ class Scheduler:
             f"task {task.task_id} dispatched to {worker.name}" + (" (speculative)" if speculative else ""),
             task_id=task.task_id, worker_id=worker.worker_id,
         )
+        return True
 
     def _build_spec(self, job: Job, task: Task) -> dict:
         spec: dict = {
